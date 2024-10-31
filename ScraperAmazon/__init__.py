@@ -256,36 +256,6 @@ class WebScraperImproved:
         text = re.sub(r'\s+', ' ', text)
         return text.strip()
 
-    def process_table(self, table, table_name, product_data):
-        """Process a single table"""
-        try:
-            if table_name == 'new_table':
-                items = table.find_all('li')
-                for item in items:
-                    key_element = item.select_one('span.a-text-bold')
-                    value_element = item.find(
-                        'span', class_=lambda x: x != 'a-text-bold')
-                    if key_element and value_element:
-                        key = self.clean_text(
-                            key_element.text.strip().replace(':', ''))
-                        value = self.clean_text(value_element.text.strip())
-                        product_data[key] = value
-            else:
-                rows = table.find_all('tr')
-                for row in rows:
-                    key_element = row.find(['th', 'td'])
-                    value_element = row.find_all(
-                        'td')[-1] if row.find_all('td') else None
-                    if key_element and value_element:
-                        key = self.clean_text(key_element.get_text(strip=True))
-                        value = self.clean_text(
-                            value_element.get_text(strip=True))
-                        product_data[key] = value
-        except Exception as e:
-            logging.error(f"Error processing table {table_name}: {str(e)}")
-
-        return product_data
-
     async def scrape_product_data(self, url, region):
         """Scrape data for a single product"""
         if url in self.scraped_urls:
@@ -312,18 +282,43 @@ class WebScraperImproved:
                 "Reviews": self._extract_reviews(soup)
             }
 
-            # Process tables directly
+            # Extract data from tables (first_table, tech_specs, right_table, new_table)
             tables = {
-                'first_table': soup.select_one('.a-normal.a-spacing-micro'),
-                'tech_specs': soup.select_one('#productDetails_techSpec_section_1'),
-                'right_table': soup.select_one('#productDetails_detailBullets_sections1'),
-                'new_table': soup.select_one('ul.a-unordered-list.a-nostyle.a-vertical.a-spacing-none.detail-bullet-list')
+                'first_table': '.a-normal.a-spacing-micro',
+                'tech_specs': '#productDetails_techSpec_section_1',
+                'right_table': '#productDetails_detailBullets_sections1',
+                'new_table': 'ul.a-unordered-list.a-nostyle.a-vertical.a-spacing-none.detail-bullet-list',
+                'bestseller_rank': 'table.a-keyvalue.prodDetTable'
             }
 
-            for table_name, table in tables.items():
+            for table_name, selector in tables.items():
+                table = soup.select_one(selector)
                 if table:
-                    product_data = self.process_table(
-                        table, table_name, product_data)
+                    if table_name == 'new_table':
+                        items = table.find_all('li')
+                        for item in items:
+                            key_element = item.select_one('span.a-text-bold')
+                            value_element = item.find(
+                                'span', class_=lambda x: x != 'a-text-bold')
+                            if key_element and value_element:
+                                key = self.clean_text(
+                                    key_element.text.strip().replace(':', ''))
+                                value = self.clean_text(
+                                    value_element.text.strip())
+                                # value = remove_key_from_value(key, value)
+                                product_data[key] = value
+                    else:
+                        rows = table.find_all('tr')
+                        for row in rows:
+                            key_element = row.find(['th', 'td'])
+                            value_element = row.find_all(
+                                'td')[-1] if row.find_all('td') else None
+                            if key_element and value_element:
+                                key = self.clean_text(
+                                    key_element.get_text(strip=True))
+                                value = self.clean_text(
+                                    value_element.get_text(strip=True))
+                                product_data[key] = value
 
             product_data = self._validate_product_data(product_data)
 
@@ -342,6 +337,7 @@ class WebScraperImproved:
         current_page_url = start_page_url
         page_number = 1
         pages_scraped = 0
+        retry_count = 0  # Initialize retry counter
 
         # Create semaphore for concurrent requests
         sem = asyncio.Semaphore(self.config['max_concurrent_requests'])
@@ -358,43 +354,61 @@ class WebScraperImproved:
                 products, next_page = await self.scrape_page_products(current_page_url, region)
 
                 if products:
+                    # Reset retry counter on successful scrape
+                    retry_count = 0
                     all_product_links.update(products)
                     logging.info(
                         f"Found {len(products)} product links on page {page_number}. "
                         f"Total unique products: {len(all_product_links)}"
                     )
+
+                    pages_scraped += 1
+                    current_page_url = next_page
+                    page_number += 1
+
+                    # Implement pause after scraping configured number of pages
+                    if pages_scraped >= self.config['max_pages_before_pause']:
+                        pause_duration = random.uniform(
+                            *self.config['pause_duration']
+                        )
+                        logging.info(
+                            f"Pausing for {pause_duration:.2f} seconds after "
+                            f"scraping {pages_scraped} pages."
+                        )
+                        await asyncio.sleep(pause_duration)
+                        pages_scraped = 0
+
+                    # Random delay between pages
+                    await asyncio.sleep(
+                        random.uniform(*self.config['request_delay'])
+                    )
                 else:
+                    retry_count += 1
+                    if retry_count >= self.config['max_retries']:
+                        logging.error(
+                            f"Max retries ({self.config['max_retries']}) reached for page {page_number}. Moving to next page."
+                        )
+                        # Move to next page or break if no next page
+                        if not next_page:
+                            break
+                        current_page_url = next_page
+                        page_number += 1
+                        retry_count = 0  # Reset retry counter for new page
+                        continue
+
                     logging.warning(
-                        f"No products found on page {page_number}. Retrying..."
+                        f"No products found on page {page_number}. Retry {retry_count}/{self.config['max_retries']}"
                     )
                     await asyncio.sleep(self.config['retry_delay'])
-                    continue
-
-                pages_scraped += 1
-
-                # Implement pause after scraping configured number of pages
-                if pages_scraped >= self.config['max_pages_before_pause']:
-                    pause_duration = random.uniform(
-                        *self.config['pause_duration']
-                    )
-                    logging.info(
-                        f"Pausing for {pause_duration:.2f} seconds after "
-                        f"scraping {pages_scraped} pages."
-                    )
-                    await asyncio.sleep(pause_duration)
-                    pages_scraped = 0
-
-                current_page_url = next_page
-                page_number += 1
-
-                # Random delay between pages
-                await asyncio.sleep(
-                    random.uniform(*self.config['request_delay'])
-                )
 
             except Exception as e:
                 logging.error(f"Error scraping page {page_number}: {str(e)}")
-                break
+                retry_count += 1
+                if retry_count >= self.config['max_retries']:
+                    logging.error(
+                        f"Max retries reached for page {page_number}. Stopping.")
+                    break
+                await asyncio.sleep(self.config['retry_delay'])
 
         logging.info(
             f"Total unique product links found: {len(all_product_links)}")
