@@ -34,14 +34,19 @@ class WebScraper:
             self.current_user_agent_index + 1) % len(self.user_agents)
         return user_agent
 
-    async def fetch_page(self, session, url, max_retries=2, retry_delay=2):
+    async def fetch_page(self, session, url, max_retries=3, initial_delay=2):
         user_agent = self.get_next_user_agent()
         headers = {
             "User-Agent": user_agent,
             "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
             "Accept-Language": "ja-JP,ja;q=0.9,en-US;q=0.8,en;q=0.7",
+            "Accept-Encoding": "gzip, deflate, br",
+            "Connection": "keep-alive",
+            "Upgrade-Insecure-Requests": "1"
         }
-
+        captcha_indicators = ["captcha", "i am not a robot",
+                              "robot", "prove you are human", "Enter the characters"]
+        delay = initial_delay
         for attempt in range(max_retries):
             try:
                 async with session.get(url, headers=headers) as response:
@@ -50,84 +55,37 @@ class WebScraper:
                             "CAPTCHA detected via HTTP status 403.")
                         return None
 
+                    raw_html = await response.read()
+
+                    # Detect encoding using chardet
+                    encoding = chardet.detect(raw_html)['encoding'] or 'utf-8'
+
                     try:
-                        # Try using response.text() first
-                        html = await response.text()
-                    except aiohttp.ClientPayloadError:
-                        # Fallback to manual decoding if decoding fails
-                        raw_html = await response.read()
-                        encoding = chardet.detect(
-                            raw_html).get('encoding', 'utf-8')
-                        html = raw_html.decode(encoding, errors="replace")
+                        html = raw_html.decode(encoding)
+                    except UnicodeDecodeError:
+                        logging.error(
+                            f"Failed to decode using {encoding}. Retrying with 'utf-8' with errors='replace'.")
+                        html = raw_html.decode('utf-8', errors='replace')
+
+                    if any(indicator in str(response.url).lower() for indicator in captcha_indicators):
+                        logging.warning("CAPTCHA detected!")
+                        return None
 
                     logging.info(f"Successfully fetched page from {url[-4:]}")
                     return html
 
             except asyncio.TimeoutError:
-                logging.error(f"Timeout fetching {url}. Retrying...")
+                logging.error(
+                    f"Timeout error occurred while fetching {url}. Retrying...")
+                await asyncio.sleep(delay)
+                delay *= 1.5  # Exponential backoff
             except aiohttp.ClientError as e:
                 logging.error(f"Error fetching {url}: {str(e)}")
-
-            # Constant retry delay
-            await asyncio.sleep(retry_delay)
+                await asyncio.sleep(delay)
+                delay *= 1.5  # Exponential backoff
 
         logging.error(f"Max retries reached for {url}")
         return None
-
-# This an old fetch_page
-
-    # async def fetch_page(self, session, url, max_retries=3, initial_delay=2):
-    #     user_agent = self.get_next_user_agent()
-    #     headers = {
-    #         "User-Agent": user_agent,
-    #         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
-    #         "Accept-Language": "ja-JP,ja;q=0.9,en-US;q=0.8,en;q=0.7",
-    #         "Accept-Encoding": "gzip, deflate, br",
-    #         "Connection": "keep-alive",
-    #         "Upgrade-Insecure-Requests": "1"
-    #     }
-    #     captcha_indicators = ["captcha", "i am not a robot",
-    #                           "robot", "prove you are human", "Enter the characters"]
-    #     delay = initial_delay
-    #     for attempt in range(max_retries):
-    #         try:
-    #             async with session.get(url, headers=headers) as response:
-    #                 if response.status == 403:
-    #                     logging.warning(
-    #                         "CAPTCHA detected via HTTP status 403.")
-    #                     return None
-
-    #                 raw_html = await response.read()
-
-    #                 # Detect encoding using chardet
-    #                 encoding = chardet.detect(raw_html)['encoding'] or 'utf-8'
-
-    #                 try:
-    #                     html = raw_html.decode(encoding)
-    #                 except UnicodeDecodeError:
-    #                     logging.error(
-    #                         f"Failed to decode using {encoding}. Retrying with 'utf-8' with errors='replace'.")
-    #                     html = raw_html.decode('utf-8', errors='replace')
-
-    #                 if any(indicator in str(response.url).lower() for indicator in captcha_indicators):
-    #                     logging.warning("CAPTCHA detected!")
-    #                     return None
-
-    #                 logging.info(f"Successfully fetched page from {url[-4:]}")
-    #                 return html
-
-    #         except asyncio.TimeoutError:
-    #             logging.error(
-    #                 f"Timeout error occurred while fetching {url}. Retrying...")
-    #             await asyncio.sleep(delay)
-    #             delay *= 1.5  # Exponential backoff
-    #         except aiohttp.ClientError as e:
-    #             logging.error(f"Error fetching {url}: {str(e)}")
-    #             await asyncio.sleep(delay)
-    #             delay *= 1.5  # Exponential backoff
-
-    #     logging.error(f"Max retries reached for {url}")
-    #     return None
 
     def clean_text(self, text):
         text = re.sub(r'[\u200f\u200e]', '', text)
